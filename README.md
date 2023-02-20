@@ -10,6 +10,11 @@ Dealing with non-stationarity in environments (e.g., in the transition dynamics)
 
 **We are currently in the process of organizing the codebase and will release the final codebase with both PT and TF versions, stay tuned!**
 
+TODO
+
+- arrange codes (Pytorch and Tensorflow 2) and envs
+
+- update README
 
 ## Acknowledgements
 Parts of code were built upon [VariBAD](https://github.com/lmzintgraf/varibad).
