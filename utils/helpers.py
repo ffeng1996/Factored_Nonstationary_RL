@@ -1,6 +1,6 @@
 import os
 import pickle
-
+# import pickle5 as pickle
 import random
 import warnings
 from distutils.util import strtobool
@@ -14,11 +14,12 @@ from environments.parallel_envs import make_vec_envs
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-
 def reset_env(env, args, indices=None, state=None):
+    """ env can be many environments or just one """
+    # reset all environments
     if (indices is None) or (len(indices) == args.num_processes):
         state = env.reset().float().to(device)
-
+    # reset only the ones given by indices
     else:
         assert state is not None
         for i in indices:
@@ -26,7 +27,7 @@ def reset_env(env, args, indices=None, state=None):
 
     belief = torch.from_numpy(env.get_belief()).float().to(device) if args.pass_belief_to_policy else None
     task = torch.from_numpy(env.get_task()).float().to(device) if args.pass_task_to_policy else None
-
+        
     return state, belief, task
 
 
@@ -51,8 +52,7 @@ def env_step(env, action, args):
         reward = reward.to(device)
 
     belief = torch.from_numpy(env.get_belief()).float().to(device) if args.pass_belief_to_policy else None
-    task = torch.from_numpy(env.get_task()).float().to(device) if (
-                args.pass_task_to_policy or args.decode_task) else None
+    task = torch.from_numpy(env.get_task()).float().to(device) if (args.pass_task_to_policy or args.decode_task) else None
 
     return [next_obs, belief, task], reward, done, infos
 
@@ -63,16 +63,11 @@ def select_action(args,
                   state=None,
                   belief=None,
                   task=None,
-                  latent_state_sample=None, latent_state_mean=None, latent_state_logvar=None,
-                  latent_rew_sample=None, latent_rew_mean=None, latent_rew_logvar=None):
-    latent_state, latent_rew = get_latent_for_policy(args=args, latent_state_sample=latent_state_sample,
-                                                     latent_state_mean=latent_state_mean,
-                                                     latent_state_logvar=latent_state_logvar,
-                                                     latent_rew_sample=latent_rew_sample,
-                                                     latent_rew_mean=latent_rew_mean,
-                                                     latent_rew_logvar=latent_rew_logvar)
-    action = policy.act(state=state, latent_state=latent_state, latent_rew=latent_rew, belief=belief, task=task,
-                        deterministic=deterministic)
+                  latent_sample=None, latent_mean=None, latent_logvar=None):
+    """ Select action using the policy. """
+    latent = get_latent_for_policy(args=args, latent_sample=latent_sample, latent_mean=latent_mean,
+                                   latent_logvar=latent_logvar)
+    action = policy.act(state=state, latent=latent, belief=belief, task=task, deterministic=deterministic)
     if isinstance(action, list) or isinstance(action, tuple):
         value, action = action
     else:
@@ -81,50 +76,39 @@ def select_action(args,
     return value, action
 
 
-def get_latent_for_policy(args, latent_state_sample=None, latent_state_mean=None, latent_state_logvar=None,
-                          latent_rew_sample=None, latent_rew_mean=None, latent_rew_logvar=None):
-    if (latent_state_sample is None) and (latent_state_mean is None) and (latent_state_logvar is None):
-        return None
-    if (latent_rew_sample is None) and (latent_rew_mean is None) and (latent_rew_logvar is None):
+def get_latent_for_policy(args, latent_sample=None, latent_mean=None, latent_logvar=None):
+
+    if (latent_sample is None) and (latent_mean is None) and (latent_logvar is None):
         return None
 
     if args.add_nonlinearity_to_latent:
-        latent_state_sample = F.relu(latent_state_sample)
-        latent_state_mean = F.relu(latent_state_mean)
-        latent_state_logvar = F.relu(latent_state_logvar)
-
-        latent_rew_sample = F.relu(latent_rew_sample)
-        latent_rew_mean = F.relu(latent_rew_mean)
-        latent_rew_logvar = F.relu(latent_rew_logvar)
+        latent_sample = F.relu(latent_sample)
+        latent_mean = F.relu(latent_mean)
+        latent_logvar = F.relu(latent_logvar)
 
     if args.sample_embeddings:
-        latent_state = latent_state_sample
-        latent_rew = latent_rew_sample
+        latent = latent_sample
     else:
-        latent_state = torch.cat((latent_state_mean, latent_state_logvar), dim=-1)
-        latent_rew = torch.cat((latent_rew_mean, latent_rew_logvar), dim=-1)
+        latent = torch.cat((latent_mean, latent_logvar), dim=-1)
 
-    if latent_state.shape[0] == 1:
-        latent_state = latent_state.squeeze(0)
+    if latent.shape[0] == 1:
+        latent = latent.squeeze(0)
 
-    if latent_rew.shape[0] == 1:
-        latent_rew = latent_rew.squeeze(0)
-
-    return latent_state, latent_rew
+    return latent
 
 
 def update_encoding(encoder, next_obs, action, reward, done, hidden_state):
+    # reset hidden state of the recurrent net when we reset the task
     if done is not None:
-        hidden_state = encoder.reset_hidden(hidden_state, done)
-
+        hidden_state_s = encoder.reset_hidden(hidden_state, done)
     with torch.no_grad():
-        latent_sample, latent_mean, latent_logvar, hidden_state = encoder(actions=action.float(),
+        latent_sample_s, latent_mean_s, latent_logvar_s, hidden_state_s = encoder(actions=action.float(),
                                                                           states=next_obs,
                                                                           rewards=reward,
                                                                           hidden_state=hidden_state,
                                                                           return_prior=False)
 
-    return latent_sample, latent_mean, latent_logvar, hidden_state
+    return latent_sample_s, latent_mean_s, latent_logvar_s, hidden_state_s
 
 
 def seed(seed, deterministic_execution=False):
@@ -144,6 +128,7 @@ def seed(seed, deterministic_execution=False):
 
 
 def update_linear_schedule(optimizer, epoch, total_num_epochs, initial_lr):
+    """Decreases the learning rate linearly"""
     lr = initial_lr - (initial_lr * (epoch / float(total_num_epochs)))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -157,72 +142,72 @@ def recompute_embeddings(
         update_idx,
         detach_every
 ):
-    latent_sample_s = [policy_storage.latent_samples_s[0].detach().clone()]
-    latent_mean_s = [policy_storage.latent_mean_s[0].detach().clone()]
-    latent_logvar_s = [policy_storage.latent_logvar_s[0].detach().clone()]
+    # get the prior
+    tot_latent_samples = policy_storage.latent_samples[0].detach().clone()
+    tot_latent_mean = policy_storage.latent_mean[0].detach().clone()
+    tot_latent_logvar = policy_storage.latent_logvar[0].detach().clone()
+    latent_sample_s = [torch.split(tot_latent_samples, tot_latent_samples.size(1) // 2, dim=-1)[0]]
+    latent_mean_s = [torch.split(tot_latent_mean, tot_latent_mean.size(1) // 2, dim=-1)[0]]
+    latent_logvar_s = [torch.split(tot_latent_logvar, tot_latent_logvar.size(1) // 2, dim=-1)[0]]
+    latent_sample_r = [torch.split(tot_latent_samples, tot_latent_samples.size(1) // 2, dim=-1)[1]]
+    latent_mean_r = [torch.split(tot_latent_mean, tot_latent_mean.size(1) // 2, dim=-1)[1]]
+    latent_logvar_r = [torch.split(tot_latent_logvar, tot_latent_logvar.size(1) // 2, dim=-1)[1]]
 
-    latent_sample_s[0].requires_grad = True
-    latent_mean_s[0].requires_grad = True
-    latent_logvar_s[0].requires_grad = True
+    tot_latent_samples[0].requires_grad = True
+    tot_latent_mean[0].requires_grad = True
+    tot_latent_logvar[0].requires_grad = True
 
-    latent_sample_r = [policy_storage.latent_samples_r[0].detach().clone()]
-    latent_mean_r = [policy_storage.latent_mean_r[0].detach().clone()]
-    latent_logvar_r = [policy_storage.latent_logvar_r[0].detach().clone()]
-
-    latent_sample_r[0].requires_grad = True
-    latent_mean_r[0].requires_grad = True
-    latent_logvar_r[0].requires_grad = True
-
-    h_s = policy_storage.hidden_states_s[0].detach()
-    h_r = policy_storage.hidden_states_r[0].detach()
+    # loop through experience and update hidden state
+    # (we need to loop because we sometimes need to reset the hidden state)
+    h = policy_storage.hidden_states[0].detach()
+    h_s, h_r = torch.split(h, h.size(1) // 2, dim=-1)
     for i in range(policy_storage.actions.shape[0]):
+        # reset hidden state of the GRU when we reset the task
         h_s = encoder_s.reset_hidden(h_s, policy_storage.done[i + 1])
         h_r = encoder_r.reset_hidden(h_r, policy_storage.done[i + 1])
-        ts_s, tm_s, tl_s, h_s = encoder_s(policy_storage.actions.float()[i:i + 1],
-                                          policy_storage.next_state[i:i + 1],
-                                          policy_storage.rewards_raw[i:i + 1],
-                                          h_s,
-                                          sample=sample,
-                                          return_prior=False,
-                                          detach_every=detach_every
-                                          )
-        ts_r, tm_r, tl_r, h_r = encoder_r(policy_storage.actions.float()[i:i + 1],
-                                          policy_storage.next_state[i:i + 1],
-                                          policy_storage.rewards_raw[i:i + 1],
-                                          h_r,
-                                          sample=sample,
-                                          return_prior=False,
-                                          detach_every=detach_every
-                                          )
+
+        ts_s, tm_s, tl_s, h_s, _, _ = encoder_s(policy_storage.actions.float()[i:i + 1],
+                                policy_storage.next_state[i:i + 1],
+                                policy_storage.rewards_raw[i:i + 1],
+                                h_s,
+                                sample=sample,
+                                return_prior=False,
+                                detach_every=detach_every
+                                )
+        ts_r, tm_r, tl_r, h_r, _, _ = encoder_r(policy_storage.actions.float()[i:i + 1],
+                                                policy_storage.next_state[i:i + 1],
+                                                policy_storage.rewards_raw[i:i + 1],
+                                                h_r,
+                                                sample=sample,
+                                                return_prior=False,
+                                                detach_every=detach_every
+                                                )
+
 
         latent_sample_s.append(ts_s)
         latent_mean_s.append(tm_s)
         latent_logvar_s.append(tl_s)
-
         latent_sample_r.append(ts_r)
         latent_mean_r.append(tm_r)
         latent_logvar_r.append(tl_r)
 
     if update_idx == 0:
         try:
-            assert (torch.cat(policy_storage.latent_mean_s) - torch.cat(latent_mean_s)).sum() == 0
-            assert (torch.cat(policy_storage.latent_logvar_s) - torch.cat(latent_logvar_s)).sum() == 0
-            assert (torch.cat(policy_storage.latent_mean_r) - torch.cat(latent_mean_r)).sum() == 0
-            assert (torch.cat(policy_storage.latent_logvar_r) - torch.cat(latent_logvar_r)).sum() == 0
+            assert (torch.cat(policy_storage.latent_mean) - torch.cat(torch.cat(latent_mean_s, latent_mean_r), dim=-1)).sum() == 0
+            assert (torch.cat(policy_storage.latent_logvar) - torch.cat(torch.cat((latent_logvar_s, latent_logvar_r), dim=-1))).sum() == 0
         except AssertionError:
             warnings.warn('You are not recomputing the embeddings correctly!')
             import pdb
             pdb.set_trace()
 
-    policy_storage.latent_samples_s = latent_sample_s
-    policy_storage.latent_mean_s = latent_mean_s
-    policy_storage.latent_logvar_s = latent_logvar_s
-    policy_storage.latent_samples_r = latent_sample_r
-    policy_storage.latent_mean_r = latent_mean_r
-    policy_storage.latent_logvar_r = latent_logvar_r
+    policy_storage.latent_samples = torch.cat((latent_sample_s, latent_sample_r), dim=-1)
+    policy_storage.latent_mean = torch.cat((latent_mean_s, latent_mean_r), dim=-1)
+    policy_storage.latent_logvar = torch.cat((latent_logvar_s, latent_logvar_r), dim=-1)
 
 
 class FeatureExtractor(nn.Module):
+    """ Used for extrating features for states/actions/rewards """
+
     def __init__(self, input_size, output_size, activation_function):
         super(FeatureExtractor, self).__init__()
         self.output_size = output_size
@@ -261,7 +246,6 @@ def load_obj(folder, name):
 
 
 class RunningMeanStd(object):
-
     def __init__(self, epsilon=1e-4, shape=()):
         self.mean = torch.zeros(shape).float().to(device)
         self.var = torch.ones(shape).float().to(device)
@@ -294,6 +278,7 @@ def update_mean_var_count_from_moments(mean, var, count, batch_mean, batch_var, 
 
 
 def boolean_argument(value):
+    """Convert a string value to boolean."""
     return bool(strtobool(value))
 
 

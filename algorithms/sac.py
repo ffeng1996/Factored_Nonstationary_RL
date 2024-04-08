@@ -1,128 +1,158 @@
-import os
+"""
+Based on https://github.com/ikostrikov/pytorch-a2c-ppo-acktr
+"""
 import torch
-import torch.nn.functional as F
-from torch.optim import Adam
-from utils import soft_update, hard_update
-from models.policy import GaussianPolicy, QNetwork
+import torch.nn as nn
+import torch.optim as optim
+
+from utils import helpers as utl
 
 
-class SAC(object):
-    def __init__(self, num_inputs, action_space, args):
-        self.gamma = args.gamma
-        self.tau = args.tau
-        self.alpha = args.alpha
+class SAC:
+    def __init__(self,
+                 args,
+                 actor_critic,
+                 value_loss_coef,
+                 entropy_coef,
+                 policy_optimiser,
+                 policy_anneal_lr,
+                 train_steps,
+                 optimiser_vae=None,
+                 lr=None,
+                 eps=None,
+                 ):
+        self.args = args
 
-        self.policy_type = args.policy
-        self.target_update_interval = args.target_update_interval
-        self.automatic_entropy_tuning = args.automatic_entropy_tuning
+        # the model
+        self.actor_critic = actor_critic
 
-        self.device = torch.device("cuda" if args.cuda else "cpu")
+        # coefficients for mixing the value and entropy loss
+        self.value_loss_coef = value_loss_coef
+        self.entropy_coef = entropy_coef
 
-        self.critic = QNetwork(num_inputs, action_space.shape[0], args.hidden_size).to(device=self.device)
-        self.critic_optim = Adam(self.critic.parameters(), lr=args.lr)
+        # optimiser
+        if policy_optimiser == 'adam':
+            self.optimiser = optim.Adam(actor_critic.parameters(), lr=lr, eps=eps)
+        elif policy_optimiser == 'rmsprop':
+            self.optimiser = optim.RMSprop(actor_critic.parameters(), lr, eps=eps, alpha=0.99)
+        self.optimiser_vae = optimiser_vae
 
-        self.critic_target = QNetwork(num_inputs, action_space.shape[0], args.hidden_size).to(self.device)
-        hard_update(self.critic_target, self.critic)
+        self.lr_scheduler_policy = None
+        self.lr_scheduler_encoder = None
+        if policy_anneal_lr:
+            lam = lambda f: 1 - f / train_steps
+            self.lr_scheduler_policy = optim.lr_scheduler.LambdaLR(self.optimiser, lr_lambda=lam)
+            if hasattr(self.args, 'rlloss_through_encoder') and self.args.rlloss_through_encoder:
+                self.lr_scheduler_encoder = optim.lr_scheduler.LambdaLR(self.optimiser_vae, lr_lambda=lam)
 
-        if self.policy_type == "Gaussian":
+    def update(self,
+               policy_storage,
+               encoder_s=None,
+               encoder_r=None,
+               rlloss_through_encoder=False,  # whether or not to backprop RL loss through encoder
+               compute_vae_loss=None,  # function that can compute the VAE loss
+               freeze=False
+               ):
 
-            if self.automatic_entropy_tuning is True:
-                self.target_entropy = -torch.prod(torch.Tensor(action_space.shape).to(self.device)).item()
-                self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-                self.alpha_optim = Adam([self.log_alpha], lr=args.lr)
+        # get action values
+        advantages = policy_storage.returns[:-1] - policy_storage.value_preds[:-1]
 
-            self.policy = GaussianPolicy(num_inputs, action_space.shape[0], args.hidden_size, action_space).to(
-                self.device)
-            self.policy_optim = Adam(self.policy.parameters(), lr=args.lr)
+        if rlloss_through_encoder:
+            # re-compute encoding (to build the computation graph from scratch)
+            utl.recompute_embeddings(policy_storage, encoder_s, encoder_r, sample=False, update_idx=0,
+                                     detach_every=self.args.tbptt_stepsize if hasattr(self.args,
+                                                                                      'tbptt_stepsize') else None)
 
-    def select_action(self, state, evaluate=False):
-        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
-        if evaluate is False:
-            action, _, _ = self.policy.sample(state)
-        else:
-            _, _, action = self.policy.sample(state)
-        return action.detach().cpu().numpy()[0]
+        # update the normalisation parameters of policy inputs before updating
+        self.actor_critic.update_rms(args=self.args, policy_storage=policy_storage)
 
-    def update_parameters(self, memory, batch_size, updates):
+        # call this to make sure that the action_log_probs are computed
+        # (needs to be done right here because of some caching thing when normalising actions)
+        policy_storage.before_update(self.actor_critic)
 
-        state_batch, action_batch, reward_batch, next_state_batch, mask_batch = memory.sample(batch_size=batch_size)
+        data_generator = policy_storage.feed_forward_generator(advantages, 1)
+        for sample in data_generator:
 
-        state_batch = torch.FloatTensor(state_batch).to(self.device)
-        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
-        action_batch = torch.FloatTensor(action_batch).to(self.device)
-        reward_batch = torch.FloatTensor(reward_batch).to(self.device).unsqueeze(1)
-        mask_batch = torch.FloatTensor(mask_batch).to(self.device).unsqueeze(1)
+            state_batch, belief_batch, task_batch, \
+            actions_batch, latent_sample_batch, latent_mean_batch, latent_logvar_batch, value_preds_batch, \
+            return_batch, old_action_log_probs_batch, adv_targ, next_state_batch= sample
 
-        with torch.no_grad():
-            next_state_action, next_state_log_pi, _ = self.policy.sample(next_state_batch)
-            qf1_next_target, qf2_next_target = self.critic_target(next_state_batch, next_state_action)
-            min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
-            next_q_value = reward_batch + mask_batch * self.gamma * (min_qf_next_target)
-        qf1, qf2 = self.critic(state_batch, action_batch)
-        qf1_loss = F.mse_loss(qf1, next_q_value)
-        qf2_loss = F.mse_loss(qf2, next_q_value)
-        qf_loss = qf1_loss + qf2_loss
+            if not rlloss_through_encoder:
+                state_batch = state_batch.detach()
+                if latent_sample_batch is not None:
+                    latent_sample_batch = latent_sample_batch.detach()
+                    latent_mean_batch = latent_mean_batch.detach()
+                    latent_logvar_batch = latent_logvar_batch.detach()
 
-        self.critic_optim.zero_grad()
-        qf_loss.backward()
-        self.critic_optim.step()
+            latent_batch = utl.get_latent_for_policy(args=self.args, latent_sample=latent_sample_batch,
+                                                     latent_mean=latent_mean_batch, latent_logvar=latent_logvar_batch
+                                                     )
 
-        pi, log_pi, _ = self.policy.sample(state_batch)
+            _,target_value, next_action_log_probs, next_dist_entropy = \
+                self.actor_critic.evaluate_actions(state=next_state_batch, latent=latent_batch,
+                                                   belief=belief_batch, task=task_batch,
+                                                   action=actions_batch)
+            next_q_value = return_batch + 0.99 * target_value
 
-        qf1_pi, qf2_pi = self.critic(state_batch, pi)
-        min_qf_pi = torch.min(qf1_pi, qf2_pi)
+            excepted_value,_, action_log_probs, dist_entropy = \
+                self.actor_critic.evaluate_actions(state=state_batch, latent=latent_batch,
+                                                   belief=belief_batch, task=task_batch,
+                                                   action=actions_batch)
+            excepted_Q1,excepted_Q2=self.actor_critic.critic_sac(state=state_batch, latent=latent_batch,
+                                                   belief=belief_batch, task=task_batch,
+                                                   action=actions_batch)
 
-        policy_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
+            excepted_new_Q = torch.min(excepted_Q1, excepted_Q2)
+            next_value = excepted_new_Q - action_log_probs
 
-        self.policy_optim.zero_grad()
-        policy_loss.backward()
-        self.policy_optim.step()
+            value_loss = torch.nn.MSELoss()(excepted_value, next_value.detach()).mean()
+            Q1_loss = torch.nn.MSELoss()(excepted_Q1, next_q_value.detach()).mean()  # J_Q
+            Q2_loss = torch.nn.MSELoss()(excepted_Q2, next_q_value.detach()).mean()
+            action_loss = (action_log_probs - excepted_new_Q).mean()  # according to original paper
 
-        if self.automatic_entropy_tuning:
-            alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
+            # --  UPDATE --
 
-            self.alpha_optim.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optim.step()
+            # zero out the gradients
+            self.optimiser.zero_grad()
+            if rlloss_through_encoder:
+                self.optimiser_vae.zero_grad()
 
-            self.alpha = self.log_alpha.exp()
-            alpha_tlogs = self.alpha.clone()
-        else:
-            alpha_loss = torch.tensor(0.).to(self.device)
-            alpha_tlogs = torch.tensor(self.alpha)
+            # compute policy loss and backprop
 
-        if updates % self.target_update_interval == 0:
-            soft_update(self.critic_target, self.critic, self.tau)
+            loss = value_loss + Q1_loss + Q2_loss + action_loss
 
-        return qf1_loss.item(), qf2_loss.item(), policy_loss.item(), alpha_loss.item(), alpha_tlogs.item()
+            # compute vae loss and backprop
+            if rlloss_through_encoder:
+                loss += self.args.vae_loss_coeff * compute_vae_loss()
 
-    def save_checkpoint(self, env_name, suffix="", ckpt_path=None):
-        if not os.path.exists('checkpoints/'):
-            os.makedirs('checkpoints/')
-        if ckpt_path is None:
-            ckpt_path = "checkpoints/sac_checkpoint_{}_{}".format(env_name, suffix)
-        print('Saving models to {}'.format(ckpt_path))
-        torch.save({'policy_state_dict': self.policy.state_dict(),
-                    'critic_state_dict': self.critic.state_dict(),
-                    'critic_target_state_dict': self.critic_target.state_dict(),
-                    'critic_optimizer_state_dict': self.critic_optim.state_dict(),
-                    'policy_optimizer_state_dict': self.policy_optim.state_dict()}, ckpt_path)
+            # compute gradients (will attach to all networks involved in this computation)
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.args.policy_max_grad_norm)
+            if encoder_s is not None and encoder_r is not None and rlloss_through_encoder:
+                nn.utils.clip_grad_norm_(encoder_s.parameters(), self.args.encoder_max_grad_norm)
+                nn.utils.clip_grad_norm_(encoder_r.parameters(), self.args.encoder_max_grad_norm)
 
-    def load_checkpoint(self, ckpt_path, evaluate=False):
-        print('Loading models from {}'.format(ckpt_path))
-        if ckpt_path is not None:
-            checkpoint = torch.load(ckpt_path)
-            self.policy.load_state_dict(checkpoint['policy_state_dict'])
-            self.critic.load_state_dict(checkpoint['critic_state_dict'])
-            self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
-            self.critic_optim.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-            self.policy_optim.load_state_dict(checkpoint['policy_optimizer_state_dict'])
+            # update
+            self.optimiser.step()
+            if rlloss_through_encoder:
+                self.optimiser_vae.step()
 
-            if evaluate:
-                self.policy.eval()
-                self.critic.eval()
-                self.critic_target.eval()
-            else:
-                self.policy.train()
-                self.critic.train()
-                self.critic_target.train()
+        if (not rlloss_through_encoder) and (self.optimiser_vae is not None):
+            for _ in range(self.args.num_vae_updates):
+                compute_vae_loss(update=True)
+
+        if self.lr_scheduler_policy is not None:
+            self.lr_scheduler_policy.step()
+        if self.lr_scheduler_encoder is not None:
+            self.lr_scheduler_encoder.step()
+
+        #update target
+        for target_param, param in zip(self.actor_critic.critic_layers2.parameters(), self.actor_critic.critic_layers.parameters()):
+            target_param.data.copy_(target_param * (1 - 0.01) + param * 0.01)
+        for target_param, param in zip(self.actor_critic.critic_linear2.parameters(), self.actor_critic.critic_linear.parameters()):
+            target_param.data.copy_(target_param * (1 - 0.01) + param * 0.01)
+
+        return value_loss, action_loss, dist_entropy, loss
+
+    def act(self, state, latent, belief, task, deterministic=False):
+        return self.actor_critic.act(state=state, latent=latent, belief=belief, task=task, deterministic=deterministic)

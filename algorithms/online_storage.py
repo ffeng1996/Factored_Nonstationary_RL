@@ -1,9 +1,16 @@
+"""
+Based on https://github.com/ikostrikov/pytorch-a2c-ppo-acktr
+
+Used for on-policy rollout storages.
+"""
 import torch
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 
 from utils import helpers as utl
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+from utils.helpers import device
+
+# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 def _flatten_helper(T, N, _tensor):
@@ -22,27 +29,32 @@ class OnlineStorage(object):
         self.belief_dim = belief_dim
         self.task_dim = task_dim
 
-        self.num_steps = num_steps
-        self.num_processes = num_processes
-        self.step = 0
+        self.num_steps = num_steps  # how many steps to do per update (= size of online buffer)
+        self.num_processes = num_processes  # number of parallel processes
+        self.step = 0  # keep track of current environment step
 
+        # normalisation of the rewards
         self.normalise_rewards = normalise_rewards
 
+        # inputs to the policy
+        # this will include s_0 when state was reset (hence num_steps+1)
         self.prev_state = torch.zeros(num_steps + 1, num_processes, state_dim)
-
-        self.latent_dim = latent_dim
-        self.latent_samples_s = []
-        self.latent_mean_s = []
-        self.latent_logvar_s = []
-        self.latent_samples_r = []
-        self.latent_mean_r = []
-        self.latent_logvar_r = []
-        self.hidden_size = hidden_size
-        self.hidden_states_s = torch.zeros(num_steps + 1, num_processes, hidden_size)
-        self.hidden_states_r = torch.zeros(num_steps + 1, num_processes, hidden_size)
-        self.curr_state = torch.zeros(num_steps, num_processes, state_dim)
-        self.next_state = torch.zeros(num_steps, num_processes, state_dim)
-
+        if self.args.pass_latent_to_policy:
+            # latent variables (of VAE)
+            self.latent_dim = latent_dim
+            self.latent_samples = []
+            self.latent_mean = []
+            self.latent_logvar = []
+            # hidden states of RNN (necessary if we want to re-compute embeddings)
+            self.hidden_size = hidden_size
+            self.hidden_states = torch.zeros(num_steps + 1, num_processes, hidden_size)
+            # next_state will include s_N when state was reset, skipping s_0
+            # (only used if we need to re-compute embeddings after backpropagating RL loss through encoder)
+            self.next_state = torch.zeros(num_steps, num_processes, state_dim)
+        else:
+            self.latent_mean = None
+            self.latent_logvar = None
+            self.latent_samples = None
         if self.args.pass_belief_to_policy:
             self.beliefs = torch.zeros(num_steps + 1, num_processes, belief_dim)
         else:
@@ -52,25 +64,25 @@ class OnlineStorage(object):
         else:
             self.tasks = None
 
-        self.curr_rewards_raw = torch.zeros(num_steps, num_processes, 1)
-        self.curr_rewards_normalised = torch.zeros(num_steps, num_processes, 1)
-        self.next_rewards_raw = torch.zeros(num_steps, num_processes, 1)
-        self.next_rewards_normalised = torch.zeros(num_steps, num_processes, 1)
+        # rewards and end of episodes
+        self.rewards_raw = torch.zeros(num_steps, num_processes, 1)
+        self.rewards_normalised = torch.zeros(num_steps, num_processes, 1)
         self.done = torch.zeros(num_steps + 1, num_processes, 1)
         self.masks = torch.ones(num_steps + 1, num_processes, 1)
+        # masks that indicate whether it's a true terminal state (false) or time limit end state (true)
         self.bad_masks = torch.ones(num_steps + 1, num_processes, 1)
 
+        # actions
         if action_space.__class__.__name__ == 'Discrete':
             action_shape = 1
         else:
             action_shape = action_space.shape[0]
-        self.prev_actions = torch.zeros(num_steps + 1, num_processes, action_shape)
-        self.curr_actions = torch.zeros(num_steps, num_processes, action_shape)
-        self.next_actions = torch.zeros(num_steps, num_processes, action_shape)
+        self.actions = torch.zeros(num_steps, num_processes, action_shape)
         if action_space.__class__.__name__ == 'Discrete':
             self.actions = self.actions.long()
         self.action_log_probs = None
 
+        # values and returns
         self.value_preds = torch.zeros(num_steps + 1, num_processes, 1)
         self.returns = torch.zeros(num_steps + 1, num_processes, 1)
 
@@ -109,33 +121,25 @@ class OnlineStorage(object):
                masks,
                bad_masks,
                done,
-
-               hidden_states_s=None,
-               latent_sample_s=None,
-               latent_mean_s=None,
-               latent_logvar_s=None,
-               hidden_states_r=None,
-               latent_sample_r=None,
-               latent_mean_r=None,
-               latent_logvar_r=None,
+               #
+               hidden_states=None,
+               latent_sample=None,
+               latent_mean=None,
+               latent_logvar=None,
                ):
-        self.curr_state[self.step + 1].copy_(state)
+        self.prev_state[self.step + 1].copy_(state)
         if self.args.pass_belief_to_policy:
             self.beliefs[self.step + 1].copy_(belief)
         if self.args.pass_task_to_policy:
             self.tasks[self.step + 1].copy_(task)
         if self.args.pass_latent_to_policy:
-            self.latent_samples_s.append(latent_sample_s.detach().clone())
-            self.latent_samples_r.append(latent_sample_r.detach().clone())
-            self.latent_mean_s.append(latent_mean_s.detach().clone())
-            self.latent_mean_r.append(latent_mean_r.detach().clone())
-            self.latent_logvar_s.append(latent_logvar_s.detach().clone())
-            self.latent_logvar_r.append(latent_logvar_r.detach().clone())
-            self.hidden_states_s[self.step + 1].copy_(hidden_states_s.detach())
-            self.hidden_states_r[self.step + 1].copy_(hidden_states_r.detach())
-        self.curr_actions[self.step] = actions.detach().clone()
-        self.curr_rewards_raw[self.step].copy_(rewards_raw)
-        self.curr_rewards_normalised[self.step].copy_(rewards_normalised)
+            self.latent_samples.append(latent_sample.detach().clone())
+            self.latent_mean.append(latent_mean.detach().clone())
+            self.latent_logvar.append(latent_logvar.detach().clone())
+            self.hidden_states[self.step + 1].copy_(hidden_states.detach())
+        self.actions[self.step] = actions.detach().clone()
+        self.rewards_raw[self.step].copy_(rewards_raw)
+        self.rewards_normalised[self.step].copy_(rewards_normalised)
         if isinstance(value_preds, list):
             self.value_preds[self.step].copy_(value_preds[0].detach())
         else:
@@ -152,14 +156,10 @@ class OnlineStorage(object):
         if self.args.pass_task_to_policy:
             self.tasks[0].copy_(self.tasks[-1])
         if self.args.pass_latent_to_policy:
-            self.latent_samples_s = []
-            self.latent_mean_s = []
-            self.latent_logvar_s = []
-            self.hidden_states_s[0].copy_(self.hidden_states[-1])
-            self.latent_samples_r = []
-            self.latent_mean_r = []
-            self.latent_logvar_r = []
-            self.hidden_states_r[0].copy_(self.hidden_states[-1])
+            self.latent_samples = []
+            self.latent_mean = []
+            self.latent_logvar = []
+            self.hidden_states[0].copy_(self.hidden_states[-1])
         self.done[0].copy_(self.done[-1])
         self.masks[0].copy_(self.masks[-1])
         self.bad_masks[0].copy_(self.bad_masks[-1])
@@ -216,7 +216,14 @@ class OnlineStorage(object):
                                                self.latent_mean[:-1]) if self.latent_mean is not None else None,
                                            latent_logvar=torch.stack(
                                                self.latent_logvar[:-1]) if self.latent_mean is not None else None)
-        _, action_log_probs, _ = policy.evaluate_actions(self.prev_state[:-1],
+        if self.args.policy=='sac':
+            _,_, action_log_probs, _ = policy.evaluate_actions(self.prev_state[:-1],
+                                                             latent,
+                                                             self.beliefs[:-1] if self.beliefs is not None else None,
+                                                             self.tasks[:-1] if self.tasks is not None else None,
+                                                             self.actions)
+        else:
+            _, action_log_probs, _ = policy.evaluate_actions(self.prev_state[:-1],
                                                          latent,
                                                          self.beliefs[:-1] if self.beliefs is not None else None,
                                                          self.tasks[:-1] if self.tasks is not None else None,
@@ -231,6 +238,12 @@ class OnlineStorage(object):
         batch_size = num_processes * num_steps
 
         if mini_batch_size is None:
+            assert batch_size >= num_mini_batch, (
+                "PPO requires the number of processes ({}) "
+                "* number of steps ({}) = {} "
+                "to be greater than or equal to the number of PPO mini batches ({})."
+                "".format(num_processes, num_steps, num_processes * num_steps,
+                          num_mini_batch))
             mini_batch_size = batch_size // num_mini_batch
         sampler = BatchSampler(
             SubsetRandomSampler(range(batch_size)),
@@ -242,6 +255,8 @@ class OnlineStorage(object):
                 state_batch = self.prev_state[:-1].reshape(-1, *self.prev_state.size()[2:])[indices]
             else:
                 state_batch = None
+            if self.args.policy=='sac':
+                next_state_batch = self.next_state.reshape(-1, *self.prev_state.size()[2:])[indices]
             if self.args.pass_latent_to_policy:
                 latent_sample_batch = torch.cat(self.latent_samples[:-1])[indices]
                 latent_mean_batch = torch.cat(self.latent_mean[:-1])[indices]
@@ -267,8 +282,13 @@ class OnlineStorage(object):
                 adv_targ = None
             else:
                 adv_targ = advantages.reshape(-1, 1)[indices]
-
-            yield state_batch, belief_batch, task_batch, \
+            if self.args.policy == 'ppo':
+                yield state_batch, belief_batch, task_batch, \
                   actions_batch, \
                   latent_sample_batch, latent_mean_batch, latent_logvar_batch, \
                   value_preds_batch, return_batch, old_action_log_probs_batch, adv_targ
+            if self.args.policy == 'sac':
+                yield state_batch, belief_batch, task_batch, \
+                      actions_batch, \
+                      latent_sample_batch, latent_mean_batch, latent_logvar_batch, \
+                      value_preds_batch, return_batch, old_action_log_probs_batch, adv_targ, next_state_batch

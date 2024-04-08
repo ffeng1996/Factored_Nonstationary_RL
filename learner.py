@@ -1,34 +1,45 @@
 import os
 import time
-
+import random
 import gym
 import numpy as np
 import torch
 
 from algorithms.online_storage import OnlineStorage
+from algorithms.ppo import PPO
 from algorithms.sac import SAC
 from environments.parallel_envs import make_vec_envs
-from models.policy import Policy
+from models.policy import Policy, SAC_Policy
 from utils import evaluation as utl_eval
 from utils import helpers as utl
 from utils.tb_logger import TBLogger
-from vae import VAE
+from vae import FNVAE
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+from collections import deque
+
+from utils.helpers import device
+
+# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 class Learner:
+    """
+    Learner class with the main training loop.
+    """
     def __init__(self, args):
 
         self.args = args
         utl.seed(self.args.seed, self.args.deterministic_execution)
 
+        # calculate number of updates and keep count of frames/iterations
         self.num_updates = int(args.num_frames) // args.policy_num_steps // args.num_processes
         self.frames = 0
         self.iter_idx = -1
 
+        # initialise tensorboard logger
         self.logger = TBLogger(self.args, self.args.exp_label)
 
+        # initialise environments
         self.envs = make_vec_envs(env_name=args.env_name, seed=args.seed, num_processes=args.num_processes,
                                   gamma=args.policy_gamma, device=device,
                                   episodes_per_task=self.args.max_rollouts_per_task,
@@ -37,108 +48,171 @@ class Learner:
                                   )
 
         if self.args.single_task_mode:
-
+            # get the current tasks (which will be num_process many different tasks)
             self.train_tasks = self.envs.get_task()
-
+            # set the tasks to the first task (i.e. just a random task)
             self.train_tasks[1:] = self.train_tasks[0]
-
+            # make it a list
             self.train_tasks = [t for t in self.train_tasks]
-
+            # re-initialise environments with those tasks
             self.envs = make_vec_envs(env_name=args.env_name, seed=args.seed, num_processes=args.num_processes,
                                       gamma=args.policy_gamma, device=device,
                                       episodes_per_task=self.args.max_rollouts_per_task,
                                       normalise_rew=args.norm_rew_for_policy, ret_rms=None,
                                       tasks=self.train_tasks
                                       )
-
+            # save the training tasks so we can evaluate on the same envs later
             utl.save_obj(self.train_tasks, self.logger.full_output_folder, "train_tasks")
         else:
             self.train_tasks = None
 
+        # calculate what the maximum length of the trajectories is
         self.args.max_trajectory_len = self.envs._max_episode_steps
         self.args.max_trajectory_len *= self.args.max_rollouts_per_task
 
+        # get policy input dimensions
         self.args.state_dim = self.envs.observation_space.shape[0]
         self.args.task_dim = self.envs.task_dim
         self.args.belief_dim = self.envs.belief_dim
         self.args.num_states = self.envs.num_states
-
+        # get policy output (action) dimensions
         self.args.action_space = self.envs.action_space
         if isinstance(self.envs.action_space, gym.spaces.discrete.Discrete):
             self.args.action_dim = 1
         else:
             self.args.action_dim = self.envs.action_space.shape[0]
 
-        self.vae = VaribadVAE(self.args, self.logger, lambda: self.iter_idx)
+        # initialise VAE and policy
+        self.vae = FNVAE(self.args, self.logger, lambda: self.iter_idx)
         self.policy_storage = self.initialise_policy_storage()
         self.policy = self.initialise_policy()
+
+        self.freeze = False
+        self.td_buffer = deque(maxlen=self.args.td_buffer_size)
 
     def initialise_policy_storage(self):
         return OnlineStorage(args=self.args,
                              num_steps=self.args.policy_num_steps,
                              num_processes=self.args.num_processes,
                              state_dim=self.args.state_dim,
-                             latent_dim=self.args.latent_dim,
+                             latent_dim=self.args.latent_dim * 2,
                              belief_dim=self.args.belief_dim,
                              task_dim=self.args.task_dim,
                              action_space=self.args.action_space,
-                             hidden_size=self.args.encoder_gru_hidden_size,
+                             hidden_size=self.args.encoder_gru_hidden_size * 2,
                              normalise_rewards=self.args.norm_rew_for_policy,
                              )
 
     def initialise_policy(self):
-        if self.args.policy == 'sac':
+
+        # initialise policy network
+        policy_net = Policy(
+            args=self.args,
+            #
+            pass_state_to_policy=self.args.pass_state_to_policy,
+            pass_latent_to_policy=self.args.pass_latent_to_policy,
+            pass_belief_to_policy=self.args.pass_belief_to_policy,
+            pass_task_to_policy=self.args.pass_task_to_policy,
+            dim_state=self.args.state_dim,
+            dim_latent=self.args.latent_dim * 2,
+            dim_belief=self.args.belief_dim,
+            dim_task=self.args.task_dim,
+            #
+            hidden_layers=self.args.policy_layers,
+            activation_function=self.args.policy_activation_function,
+            policy_initialisation=self.args.policy_initialisation,
+            #
+            action_space=self.envs.action_space,
+            init_std=self.args.policy_init_std,
+        ).to(device)
+
+        # initialise policy trainer
+        if self.args.policy == 'ppo':
+            policy = PPO(
+                self.args,
+                policy_net,
+                self.args.policy_value_loss_coef,
+                self.args.policy_entropy_coef,
+                policy_optimiser=self.args.policy_optimiser,
+                policy_anneal_lr=self.args.policy_anneal_lr,
+                train_steps=self.num_updates,
+                lr=self.args.lr_policy,
+                eps=self.args.policy_eps,
+                ppo_epoch=self.args.ppo_num_epochs,
+                num_mini_batch=self.args.ppo_num_minibatch,
+                use_huber_loss=self.args.ppo_use_huberloss,
+                use_clipped_value_loss=self.args.ppo_use_clipped_value_loss,
+                clip_param=self.args.ppo_clip_param,
+                optimiser_vae=self.vae.optimiser_vae,
+            )
+        elif self.args.policy == 'sac':
+            SAC_policy_net = SAC_Policy(
+                args=self.args,
+                #
+                pass_state_to_policy=self.args.pass_state_to_policy,
+                pass_latent_to_policy=False,
+                pass_belief_to_policy=self.args.pass_belief_to_policy,
+                pass_task_to_policy=self.args.pass_task_to_policy,
+                dim_state=self.args.state_dim,
+                dim_latent=0,
+                dim_belief=self.args.belief_dim,
+                dim_task=self.args.task_dim,
+                #
+                hidden_layers=self.args.policy_layers,
+                activation_function=self.args.policy_activation_function,
+                policy_initialisation=self.args.policy_initialisation,
+                #
+                action_space=self.envs.action_space,
+                init_std=self.args.policy_init_std,
+            ).to(device)
             policy = SAC(
-                input_dim,
-                action_dim,
-                self.args
+                self.args,
+                SAC_policy_net,
+                self.args.policy_value_loss_coef,
+                self.args.policy_entropy_coef,
+                policy_optimiser=self.args.policy_optimiser,
+                policy_anneal_lr=self.args.policy_anneal_lr,
+                train_steps=self.num_updates,
+                optimiser_vae=self.vae.optimiser_vae,
+                lr=self.args.lr_policy,
+                eps=self.args.policy_eps,
             )
         else:
             raise NotImplementedError
 
         return policy
 
-    def train(self, offline=True):
-
+    def train(self):
+        """ Main Training loop """
         start_time = time.time()
-        self.vae.compute_vae_loss(update=True, offline=True, offline_data=offline_data)
 
-        if not offline:
-            self.vae.thetas2s.requires_grad = False
-            self.vae.thetaP2thetaC.requires_grad = False
-            self.vae.sP2sC.requires_grad = False
-            self.vae.aP2sC.requires_grad = False
-            self.vae.aP2rC.requires_grad = False
-            self.vae.sP2rC.requires_grad = False
-            self.vae.optimiser_vae = torch.optim.Adam(
-                [*self.vae.encoder_r.parameters(), *self.vae.encoder_s.parameters(), *self.vae.decoder_params],
-                lr=self.args.lr_vae)
-
+        # reset environments
         prev_state, belief, task = utl.reset_env(self.envs, self.args)
 
+        # insert initial observation / embeddings to rollout storage
         self.policy_storage.prev_state[0].copy_(prev_state)
 
+        # log once before training
         with torch.no_grad():
             self.log(None, None, start_time)
 
-        for self.iter_idx in range(self.num_updates):
+        for self.iter_idx in range(self.num_updates): # self.iter_idx: the updating index
 
+            # First, re-compute the hidden states given the current rollouts (since the VAE might've changed)
             with torch.no_grad():
-                latent_sample_s, latent_mean_s, latent_logvar_s, hidden_state_s, \
-                latent_sample_r, latent_mean_r, latent_logvar_r, hidden_state_r = self.encode_running_trajectory()
+                latent_sample_s, latent_mean_s, latent_logvar_s, hidden_state_s, latent_sample_r, latent_mean_r, latent_logvar_r, hidden_state_r = self.encode_running_trajectory()
 
-            assert len(self.policy_storage.latent_mean_s) == 0 and len(self.policy_storage.latent_mean_r) == 0
-            self.policy_storage.hidden_states[0].copy_(hidden_state_s)
-            self.policy_storage.hidden_states[0].copy_(hidden_state_r)
-            self.policy_storage.latent_samples.append(latent_sample_s.clone())
-            self.policy_storage.latent_samples.append(latent_sample_r.clone())
-            self.policy_storage.latent_mean.append(latent_mean_s.clone())
-            self.policy_storage.latent_mean.append(latent_mean_r.clone())
-            self.policy_storage.latent_logvar.append(latent_logvar_s.clone())
-            self.policy_storage.latent_logvar.append(latent_logvar_r.clone())
+            # add this initial hidden state to the policy storage
+            assert len(self.policy_storage.latent_mean) == 0  # make sure we emptied buffers
+            self.policy_storage.hidden_states[0].copy_(torch.cat((hidden_state_s, hidden_state_r), dim=-1))
+            self.policy_storage.latent_samples.append(torch.cat((latent_sample_s, latent_sample_r), dim=-1).clone())
+            self.policy_storage.latent_mean.append(torch.cat((latent_mean_s, latent_mean_r), dim=-1).clone())
+            self.policy_storage.latent_logvar.append(torch.cat((latent_logvar_s, latent_logvar_r), dim=-1).clone())
 
+            # rollout policies for a few steps
             for step in range(self.args.policy_num_steps):
 
+                # sample actions from policy
                 with torch.no_grad():
                     value, action = utl.select_action(
                         args=self.args,
@@ -147,43 +221,40 @@ class Learner:
                         belief=belief,
                         task=task,
                         deterministic=False,
-                        latent_state_sample=latent_sample_s,
-                        latent_state_mean=latent_mean_s,
-                        latent_state_logvar=latent_logvar_s,
-                        latent_rew_sample=latent_sample_r,
-                        latent_rew_mean=latent_mean_r,
-                        latent_rew_logvar=latent_logvar_r
+                        latent_sample=torch.cat((latent_sample_s, latent_sample_r), dim=-1),
+                        latent_mean=torch.cat((latent_mean_s, latent_mean_r), dim=-1),
+                        latent_logvar=torch.cat((latent_logvar_s, latent_logvar_r), dim=-1),
                     )
 
-                [next_state, belief, task], (rew_raw, rew_normalised), done, infos = utl.env_step(self.envs, action,
-                                                                                                  self.args)
+                # take step in the environment
+                [next_state, belief, task], (rew_raw, rew_normalised), done, infos = utl.env_step(self.envs, action, self.args)
+
 
                 done = torch.from_numpy(np.array(done, dtype=int)).to(device).float().view((-1, 1))
-
+                # create mask for episode ends
                 masks_done = torch.FloatTensor([[0.0] if done_ else [1.0] for done_ in done]).to(device)
-
-                bad_masks = torch.FloatTensor(
-                    [[0.0] if 'bad_transition' in info.keys() else [1.0] for info in infos]).to(device)
+                # bad_mask is true if episode ended because time limit was reached
+                bad_masks = torch.FloatTensor([[0.0] if 'bad_transition' in info.keys() else [1.0] for info in infos]).to(device)
 
                 with torch.no_grad():
-
+                    # compute next embedding (for next loop and/or value prediction bootstrap)
                     latent_sample_s, latent_mean_s, latent_logvar_s, hidden_state_s = utl.update_encoding(
                         encoder=self.vae.encoder_s,
                         next_obs=next_state,
                         action=action,
                         reward=rew_raw,
                         done=done,
-                        hidden_state=hidden_state_s,
-                    )
+                        hidden_state=hidden_state_s)
                     latent_sample_r, latent_mean_r, latent_logvar_r, hidden_state_r = utl.update_encoding(
                         encoder=self.vae.encoder_r,
                         next_obs=next_state,
                         action=action,
                         reward=rew_raw,
                         done=done,
-                        hidden_state=hidden_state_r,
-                    )
+                        hidden_state=hidden_state_r)
 
+                # before resetting, update the embedding and add to vae buffer
+                # (last state might include useful task info)
                 if not (self.args.disable_decoder and self.args.disable_kl_term):
                     self.vae.rollout_storage.insert(prev_state.clone(),
                                                     action.detach().clone(),
@@ -192,13 +263,20 @@ class Learner:
                                                     done.clone(),
                                                     task.clone() if task is not None else None)
 
+                # add the obs before reset to the policy storage
                 self.policy_storage.next_state[step] = next_state.clone()
 
+                # reset environments that are done
                 done_indices = np.argwhere(done.cpu().flatten()).flatten()
                 if len(done_indices) > 0:
                     next_state, belief, task = utl.reset_env(self.envs, self.args,
                                                              indices=done_indices, state=next_state)
 
+                # TODO: deal with resampling for posterior sampling algorithm
+                #     latent_sample = latent_sample
+                #     latent_sample[i] = latent_sample[i]
+
+                # add experience to policy buffer
                 self.policy_storage.insert(
                     state=next_state,
                     belief=belief,
@@ -210,127 +288,146 @@ class Learner:
                     masks=masks_done,
                     bad_masks=bad_masks,
                     done=done,
-                    hidden_states_s=hidden_state_s.squeeze(0),
-                    latent_sample_s=latent_sample_s,
-                    latent_mean_s=latent_mean_s,
-                    latent_logvar_s=latent_logvar_s,
-                    hidden_states_r=hidden_state_r.squeeze(0),
-                    latent_sample_r=latent_sample_r,
-                    latent_mean_r=latent_mean_r,
-                    latent_logvar_r=latent_logvar_r,
+                    hidden_states=torch.cat((hidden_state_s, hidden_state_r), dim=-1).squeeze(0),
+                    latent_sample=torch.cat((latent_sample_s, latent_sample_r), dim=-1),
+                    latent_mean=torch.cat((latent_mean_s, latent_mean_r), dim=-1),
+                    latent_logvar=torch.cat((latent_logvar_s, latent_logvar_r), dim=-1),
                 )
 
                 prev_state = next_state
 
                 self.frames += self.args.num_processes
 
+            # --- UPDATE ---
+
             if self.args.precollect_len <= self.frames:
 
+                # check if we are pre-training the VAE
                 if self.args.pretrain_len > self.iter_idx:
                     for p in range(self.args.num_vae_updates_per_pretrain):
                         self.vae.compute_vae_loss(update=True,
                                                   pretrain_index=self.iter_idx * self.args.num_vae_updates_per_pretrain + p)
-
+                # otherwise do the normal update (policy + vae)
                 else:
+
                     train_stats = self.update(state=prev_state,
                                               belief=belief,
                                               task=task,
-                                              latent_sample_s=latent_sample_s,
-                                              latent_mean_s=latent_mean_s,
-                                              latent_logvar_s=latent_logvar_s,
-                                              latent_sample_r=latent_sample_r,
-                                              latent_mean_r=latent_mean_r,
-                                              latent_logvar_r=latent_logvar_r)
+                                              latent_sample=torch.cat((latent_sample_s, latent_sample_r), dim=-1),
+                                              latent_mean=torch.cat((latent_mean_s, latent_mean_r), dim=-1),
+                                              latent_logvar=torch.cat((latent_logvar_s, latent_logvar_r), dim=-1))
 
+                    # log
                     run_stats = [action, self.policy_storage.action_log_probs, value]
                     with torch.no_grad():
                         self.log(run_stats, train_stats, start_time)
 
+            # clean up after update
             self.policy_storage.after_update()
+
 
         self.envs.close()
 
     def encode_running_trajectory(self):
+        """
+        (Re-)Encodes (for each process) the entire current trajectory.
+        Returns sample/mean/logvar and hidden state (if applicable) for the current timestep.
+        :return:
+        """
 
-        prev_obs, curr_obs, next_obs, prev_act, curr_act, next_act, curr_rew, next_rew, lens = self.vae.rollout_storage.get_running_batch()
+        # for each process, get the current batch (zero-padded obs/act/rew + length indicators)
+        prev_obs, next_obs, act, rew, lens = self.vae.rollout_storage.get_running_batch()
 
-        latent_sample_state_curr, latent_mean_state_curr, latent_logvar_state_curr, hidden_state_state = self.vae.encoder_s(
-            actions=curr_act,
-            states=curr_obs,
-            rewards=None,
+        # get embedding - will return (1+sequence_len) * batch * input_size -- includes the prior!
+        all_latent_samples_s, all_latent_means_s, all_latent_logvars_s, all_hidden_states_s = self.vae.encoder_s(actions=act,
+                                                                                                       states=next_obs,
+                                                                                                       rewards=rew,
+                                                                                                       hidden_state=None,
+                                                                                                       return_prior=True)
+        all_latent_samples_r, all_latent_means_r, all_latent_logvars_r, all_hidden_states_r = self.vae.encoder_r(
+            actions=act,
+            states=next_obs,
+            rewards=rew,
             hidden_state=None,
-            return_prior=True,
-            detach_every=None,
-            )
+            return_prior=True)
 
-        latent_sample_reward_curr, latent_mean_rew_curr, latent_logvar_rew_curr, hidden_state_rew = self.vae.encoder_r(
-            actions=curr_act,
-            states=curr_obs,
-            rewards=curr_rew,
-            hidden_state=None,
-            return_prior=False,
-            detach_every=None,
-            )
+        # get the embedding / hidden state of the current time step (need to do this since we zero-padded)
+        latent_sample_s = (torch.stack([all_latent_samples_s[lens[i]][i] for i in range(len(lens))])).to(device)
+        latent_mean_s = (torch.stack([all_latent_means_s[lens[i]][i] for i in range(len(lens))])).to(device)
+        latent_logvar_s = (torch.stack([all_latent_logvars_s[lens[i]][i] for i in range(len(lens))])).to(device)
+        hidden_state_s = (torch.stack([all_hidden_states_s[lens[i]][i] for i in range(len(lens))])).to(device)
+        latent_sample_r = (torch.stack([all_latent_samples_r[lens[i]][i] for i in range(len(lens))])).to(device)
+        latent_mean_r = (torch.stack([all_latent_means_r[lens[i]][i] for i in range(len(lens))])).to(device)
+        latent_logvar_r = (torch.stack([all_latent_logvars_r[lens[i]][i] for i in range(len(lens))])).to(device)
+        hidden_state_r = (torch.stack([all_hidden_states_r[lens[i]][i] for i in range(len(lens))])).to(device)
 
-        latent_sample_s = (torch.stack([latent_sample_state_curr[lens[i]][i] for i in range(len(lens))])).to(device)
-        latent_mean_s = (torch.stack([latent_mean_state_curr[lens[i]][i] for i in range(len(lens))])).to(device)
-        latent_logvar_s = (torch.stack([latent_logvar_state_curr[lens[i]][i] for i in range(len(lens))])).to(device)
-        hidden_state_s = (torch.stack([hidden_state_state[lens[i]][i] for i in range(len(lens))])).to(device)
+        return latent_sample_s, latent_mean_s, latent_logvar_s, hidden_state_s, latent_sample_r, latent_mean_r, latent_logvar_r, hidden_state_r
 
-        latent_sample_r = (torch.stack([latent_sample_reward_curr[lens[i]][i] for i in range(len(lens))])).to(device)
-        latent_mean_r = (torch.stack([latent_mean_rew_curr[lens[i]][i] for i in range(len(lens))])).to(device)
-        latent_logvar_r = (torch.stack([latent_logvar_rew_curr[lens[i]][i] for i in range(len(lens))])).to(device)
-        hidden_state_r = (torch.stack([hidden_state_rew[lens[i]][i] for i in range(len(lens))])).to(device)
-
-        return latent_sample_s, latent_mean_s, latent_logvar_s, hidden_state_s, \
-               latent_sample_r, latent_mean_r, latent_logvar_r, hidden_state_r
-
-    def get_value(self, state, belief, task, latent_sample_s, latent_mean_s, latent_logvar_s, latent_sample_r,
-                  latent_mean_r, latent_logvar_r):
-        latent = utl.get_latent_for_policy(self.args,
-                                           latent_state_sample=latent_sample_s, latent_state_mean=latent_mean_s,
-                                           latent_state_logvar=latent_logvar_s,
-                                           latent_rew_sample=latent_sample_r, latent_rew_mean=latent_mean_r,
-                                           latent_rew_logvar=latent_logvar_r
-                                           )
+    def get_value(self, state, belief, task, latent_sample, latent_mean, latent_logvar):
+        latent = utl.get_latent_for_policy(self.args, latent_sample=latent_sample, latent_mean=latent_mean, latent_logvar=latent_logvar)
         return self.policy.actor_critic.get_value(state=state, belief=belief, task=task, latent=latent).detach()
 
-    def update(self, state, belief, task, latent_sample_s, latent_mean_s, latent_logvar_s, latent_sample_r,
-               latent_mean_r, latent_logvar_r):
-
+    def update(self, state, belief, task, latent_sample, latent_mean, latent_logvar):
+        """
+        Update.
+        Here the policy is updated for good average performance across tasks.
+        :return:
+        """
+        # update policy (if we are not pre-training, have enough data in the vae buffer, and are not at iteration 0)
         if self.iter_idx >= self.args.pretrain_len and self.iter_idx > 0:
 
+            # bootstrap next value prediction
             with torch.no_grad():
                 next_value = self.get_value(state=state,
                                             belief=belief,
                                             task=task,
-                                            latent_sample_s=latent_sample_s,
-                                            latent_mean_s=latent_mean_s,
-                                            latent_logvar_s=latent_logvar_s,
-                                            latent_sample_r=latent_sample_r,
-                                            latent_mean_r=latent_mean_r,
-                                            latent_logvar_r=latent_logvar_r
-                                            )
+                                            latent_sample=latent_sample,
+                                            latent_mean=latent_mean,
+                                            latent_logvar=latent_logvar)
 
+            # compute returns for current rollouts
             self.policy_storage.compute_returns(next_value, self.args.policy_use_gae, self.args.policy_gamma,
                                                 self.args.policy_tau,
                                                 use_proper_time_limits=self.args.use_proper_time_limits)
 
+            # update agent (this will also call the VAE update!)
             policy_train_stats = self.policy.update(
                 policy_storage=self.policy_storage,
                 encoder_s=self.vae.encoder_s,
                 encoder_r=self.vae.encoder_r,
                 rlloss_through_encoder=self.args.rlloss_through_encoder,
-                compute_vae_loss=self.vae.compute_vae_loss)
+                compute_vae_loss=self.vae.compute_vae_loss,
+                freeze=self.freeze
+            )
+            
+            td = policy_train_stats[0]
+            if len(self.td_buffer) > 0:
+                td_mean = np.mean(self.td_buffer)
+                td_std = np.std(self.td_buffer)
+            else:
+                td_mean = 0
+                td_std = 0
+            self.td_buffer.append(td)
+            recent_td = np.array(self.td_buffer)[-int(len(self.td_buffer) * self.args.td_recent_size):].mean()
+            # greedy
+            if recent_td < td_mean + self.args.confidence * td_std and\
+               recent_td > td_mean - self.args.confidence * td_std and\
+               np.random.rand() > self.args.freeze_eps:
+                self.freeze = True
+            else:
+                self.freeze = False
         else:
             policy_train_stats = 0, 0, 0, 0
 
+            # pre-train the VAE
             if self.iter_idx < self.args.pretrain_len:
                 self.vae.compute_vae_loss(update=True)
 
         return policy_train_stats
 
     def log(self, run_stats, train_stats, start_time):
+
+        # --- evaluate policy ----
 
         if (self.iter_idx + 1) % self.args.eval_interval == 0:
 
@@ -344,6 +441,7 @@ class Learner:
                                                     tasks=self.train_tasks,
                                                     )
 
+            # log the return avg/std across tasks (=processes)
             returns_avg = returns_per_episode.mean(dim=0)
             returns_std = returns_per_episode.std(dim=0)
             for k in range(len(returns_avg)):
@@ -358,6 +456,7 @@ class Learner:
                   f"\n Mean return (train): {returns_avg[-1].item()} \n"
                   )
 
+        # --- save models ---
         if (self.iter_idx + 1) % self.args.save_interval == 0:
             save_path = os.path.join(self.logger.full_output_folder, 'models')
             if not os.path.exists(save_path):
@@ -369,18 +468,22 @@ class Learner:
 
             for idx_label in idx_labels:
 
-                torch.save(self.policy.actor_critic, os.path.join(save_path, f"policy{idx_label}.pt"))
-                torch.save(self.vae.encoder, os.path.join(save_path, f"encoder{idx_label}.pt"))
+                torch.save(self.policy.actor_critic, os.path.join(save_path, "policy{idx_label}.pt"))
+                torch.save(self.vae.encoder_s, os.path.join(save_path, "encoder_s{idx_label}.pt"))
+                torch.save(self.vae.encoder_r, os.path.join(save_path, "encoder_r{idx_label}.pt"))
                 if self.vae.state_decoder is not None:
-                    torch.save(self.vae.state_decoder, os.path.join(save_path, f"state_decoder{idx_label}.pt"))
+                    torch.save(self.vae.state_decoder, os.path.join(save_path, "state_decoder{idx_label}.pt"))
                 if self.vae.reward_decoder is not None:
-                    torch.save(self.vae.reward_decoder, os.path.join(save_path, f"reward_decoder{idx_label}.pt"))
+                    torch.save(self.vae.reward_decoder, os.path.join(save_path, "reward_decoder{idx_label}.pt"))
                 if self.vae.task_decoder is not None:
-                    torch.save(self.vae.task_decoder, os.path.join(save_path, f"task_decoder{idx_label}.pt"))
+                    torch.save(self.vae.task_decoder, os.path.join(save_path, "task_decoder{idx_label}.pt"))
 
+                # save normalisation params of envs
                 if self.args.norm_rew_for_policy:
                     rew_rms = self.envs.venv.ret_rms
-                    utl.save_obj(rew_rms, save_path, f"env_rew_rms{idx_label}")
+                    utl.save_obj(rew_rms, save_path, "env_rew_rms{idx_label}")
+
+        # --- log some other things ---
 
         if ((self.iter_idx + 1) % self.args.log_interval == 0) and (train_stats is not None):
 
@@ -404,9 +507,11 @@ class Learner:
             self.logger.add('encoder/latent_mean', torch.cat(self.policy_storage.latent_mean).mean(), self.iter_idx)
             self.logger.add('encoder/latent_logvar', torch.cat(self.policy_storage.latent_logvar).mean(), self.iter_idx)
 
+            # log the average weights and gradients of all models (where applicable)
             for [model, name] in [
                 [self.policy.actor_critic, 'policy'],
-                [self.vae.encoder, 'encoder'],
+                [self.vae.encoder_s, 'encoder_s'],
+                [self.vae.encoder_r, 'encoder_r'],
                 [self.vae.reward_decoder, 'reward_decoder'],
                 [self.vae.state_decoder, 'state_transition_decoder'],
                 [self.vae.task_decoder, 'task_decoder']
@@ -418,6 +523,5 @@ class Learner:
                     if name == 'policy':
                         self.logger.add('weights/policy_std', param_list[0].data.mean(), self.iter_idx)
                     if param_list[0].grad is not None:
-                        param_grad_mean = np.mean(
-                            [param_list[i].grad.cpu().numpy().mean() for i in range(len(param_list))])
+                        param_grad_mean = np.mean([param_list[i].grad.cpu().numpy().mean() for i in range(len(param_list))])
                         self.logger.add('gradients/{}'.format(name), param_grad_mean, self.iter_idx)
